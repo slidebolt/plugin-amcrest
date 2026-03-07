@@ -3,8 +3,8 @@ module github.com/slidebolt/plugin-amcrest
 go 1.25.7
 
 require (
-	github.com/slidebolt/sdk-runner v1.6.2
-	github.com/slidebolt/sdk-types v1.5.4
+	github.com/slidebolt/sdk-runner v1.6.4
+	github.com/slidebolt/sdk-types v1.5.6
 )
 
 require (
