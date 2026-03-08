@@ -243,7 +243,19 @@ func TestOnDeviceCreateFailsWhenConnectionFails(t *testing.T) {
 		labelUsername: {"admin"},
 		labelPassword: {"pw"},
 	}})
-	if err == nil {
-		t.Fatal("expected error when device connection fails")
+		if err == nil {
+			t.Fatal("expected error when device connection fails")
+		}
 	}
-}
+	
+	func TestOnDeviceCreate_MissingCredentials(t *testing.T) {
+		p := NewPluginAdapter()
+		_, _ = p.OnInitialize(runner.Config{RawStore: newMockRawStore()}, types.Storage{})
+	
+		// Missing all required labels
+		_, err := p.OnDeviceCreate(types.Device{ID: "test-fail"})
+		if err == nil {
+			t.Fatal("BUG: OnDeviceCreate should fail when host/user/pass labels are missing")
+		}
+	}
+	
