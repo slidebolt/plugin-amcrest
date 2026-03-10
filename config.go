@@ -128,7 +128,11 @@ func parseDeviceCredentials(labels map[string][]string, defaults pluginConfig) d
 }
 
 func (d deviceCredentials) valid() bool {
-	return d.Host != "" && d.Username != "" && d.Password != "" && d.Scheme != ""
+	if strings.TrimSpace(d.Host) == "" || strings.TrimSpace(d.Username) == "" || strings.TrimSpace(d.Password) == "" {
+		return false
+	}
+	scheme := strings.ToLower(strings.TrimSpace(d.Scheme))
+	return scheme == "http" || scheme == "https"
 }
 
 func scrubSensitiveLabels(labels map[string][]string) map[string][]string {

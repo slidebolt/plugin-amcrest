@@ -104,7 +104,7 @@ func (p *PluginAdapter) OnShutdown() {
 
 func (p *PluginAdapter) OnHealthCheck() (string, error) { return "perfect", nil }
 
-func (p *PluginAdapter) OnStorageUpdate(current types.Storage) (types.Storage, error) {
+func (p *PluginAdapter) OnConfigUpdate(current types.Storage) (types.Storage, error) {
 	return current, nil
 }
 
@@ -122,7 +122,7 @@ func (p *PluginAdapter) OnDeviceCreate(dev types.Device) (types.Device, error) {
 	defer cancel()
 
 	client := p.clientFactory(creds)
-	if info, err := client.GetSystemInfo(ctx); err != nil {
+	if info, err := getSystemInfoWithTimeout(ctx, client); err != nil {
 		return dev, fmt.Errorf("amcrest connect failed: %w", err)
 	} else {
 		if model := strings.TrimSpace(info["deviceType"]); model != "" {
@@ -171,7 +171,7 @@ func (p *PluginAdapter) OnDeviceSearch(q types.SearchQuery, res []types.Device) 
 	return res, nil
 }
 
-func (p *PluginAdapter) OnDevicesList(current []types.Device) ([]types.Device, error) {
+func (p *PluginAdapter) OnDeviceDiscover(current []types.Device) ([]types.Device, error) {
 	for i := range current {
 		if current[i].ID == pluginID {
 			continue
@@ -199,7 +199,7 @@ func (p *PluginAdapter) OnEntityCreate(e types.Entity) (types.Entity, error) { r
 func (p *PluginAdapter) OnEntityUpdate(e types.Entity) (types.Entity, error) { return e, nil }
 func (p *PluginAdapter) OnEntityDelete(deviceID, entityID string) error      { return nil }
 
-func (p *PluginAdapter) OnEntitiesList(deviceID string, current []types.Entity) ([]types.Entity, error) {
+func (p *PluginAdapter) OnEntityDiscover(deviceID string, current []types.Entity) ([]types.Entity, error) {
 	if deviceID == pluginID {
 		return runner.EnsureCoreEntities(pluginID, deviceID, current), nil
 	}
@@ -548,13 +548,48 @@ func (c deviceCapabilities) any() bool {
 	return c.Snapshot || c.StreamMain || c.DoorbellPress || c.Motion
 }
 
+func getSystemInfoWithTimeout(ctx context.Context, client cameraClient) (map[string]string, error) {
+	type result struct {
+		info map[string]string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		info, err := client.GetSystemInfo(ctx)
+		done <- result{info: info, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case out := <-done:
+		return out.info, out.err
+	}
+}
+
 func sanitizeEntityID(v string) string {
 	v = strings.ToLower(strings.TrimSpace(v))
-	r := strings.NewReplacer(" ", "-", "_", "-", "/", "-", ".", "-", "&", "-", ":", "-", "(", "", ")", "")
-	v = r.Replace(v)
-	v = strings.Trim(v, "-")
 	if v == "" {
 		return "unknown"
 	}
-	return v
+	var b strings.Builder
+	b.Grow(len(v))
+	lastDash := false
+	for i := 0; i < len(v); i++ {
+		ch := v[i]
+		isAlphaNum := (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')
+		if isAlphaNum {
+			b.WriteByte(ch)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "unknown"
+	}
+	return out
 }

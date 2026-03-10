@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/slidebolt/plugin-amcrest/pkg/amcrest"
@@ -57,17 +58,22 @@ func (s *fakeSink) EmitEvent(evt types.InboundEvent) error {
 
 type mockRawStore struct {
 	devices map[string]json.RawMessage
+	mu      sync.RWMutex
 }
 
 func newMockRawStore() *mockRawStore { return &mockRawStore{devices: map[string]json.RawMessage{}} }
 
 func (m *mockRawStore) ReadRawDevice(deviceID string) (json.RawMessage, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if v, ok := m.devices[deviceID]; ok {
 		return v, nil
 	}
 	return nil, errors.New("not found")
 }
 func (m *mockRawStore) WriteRawDevice(deviceID string, data json.RawMessage) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.devices[deviceID] = append([]byte(nil), data...)
 	return nil
 }
@@ -162,7 +168,7 @@ func TestOnCommandSnapshotUsesStoredCredentials(t *testing.T) {
 	}
 }
 
-func TestOnEntitiesListRespectsCapabilities(t *testing.T) {
+func TestOnEntityDiscoverRespectsCapabilities(t *testing.T) {
 	p := NewPluginAdapter()
 	raw := newMockRawStore()
 	_, _ = p.OnInitialize(runner.Config{RawStore: raw}, types.Storage{})
@@ -186,9 +192,9 @@ func TestOnEntitiesListRespectsCapabilities(t *testing.T) {
 	data, _ := json.Marshal(creds)
 	_ = raw.WriteRawDevice("amcrest-192-168-1-60", data)
 
-	entities, err := p.OnEntitiesList("amcrest-192-168-1-60", nil)
+	entities, err := p.OnEntityDiscover("amcrest-192-168-1-60", nil)
 	if err != nil {
-		t.Fatalf("OnEntitiesList error: %v", err)
+		t.Fatalf("OnEntityDiscover error: %v", err)
 	}
 	byID := map[string]types.Entity{}
 	for _, e := range entities {
@@ -243,19 +249,18 @@ func TestOnDeviceCreateFailsWhenConnectionFails(t *testing.T) {
 		labelUsername: {"admin"},
 		labelPassword: {"pw"},
 	}})
-		if err == nil {
-			t.Fatal("expected error when device connection fails")
-		}
+	if err == nil {
+		t.Fatal("expected error when device connection fails")
 	}
-	
-	func TestOnDeviceCreate_MissingCredentials(t *testing.T) {
-		p := NewPluginAdapter()
-		_, _ = p.OnInitialize(runner.Config{RawStore: newMockRawStore()}, types.Storage{})
-	
-		// Missing all required labels
-		_, err := p.OnDeviceCreate(types.Device{ID: "test-fail"})
-		if err == nil {
-			t.Fatal("BUG: OnDeviceCreate should fail when host/user/pass labels are missing")
-		}
+}
+
+func TestOnDeviceCreate_MissingCredentials(t *testing.T) {
+	p := NewPluginAdapter()
+	_, _ = p.OnInitialize(runner.Config{RawStore: newMockRawStore()}, types.Storage{})
+
+	// Missing all required labels
+	_, err := p.OnDeviceCreate(types.Device{ID: "test-fail"})
+	if err == nil {
+		t.Fatal("BUG: OnDeviceCreate should fail when host/user/pass labels are missing")
 	}
-	
+}
