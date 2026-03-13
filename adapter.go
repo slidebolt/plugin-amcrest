@@ -36,9 +36,11 @@ type cameraClient interface {
 }
 
 type PluginAdapter struct {
-	cfg      pluginConfig
-	sink     runner.EventSink
-	rawStore runner.RawStore
+	cfg  pluginConfig
+	pctx runner.PluginContext
+
+	// Optional compatibility hook used by tests that still verify raw-device persistence.
+	rawStore deviceRawStore
 
 	clientFactory func(creds deviceCredentials) cameraClient
 
@@ -46,12 +48,23 @@ type PluginAdapter struct {
 	profiles  map[string]deviceCredentials
 	loopStops map[string]context.CancelFunc
 	loopsWG   sync.WaitGroup
+	seen      map[string]struct{}
+
+	runCtx    context.Context
+	runCancel context.CancelFunc
+	runWG     sync.WaitGroup
+}
+
+type deviceRawStore interface {
+	ReadRawDevice(deviceID string) (json.RawMessage, error)
+	WriteRawDevice(deviceID string, data json.RawMessage) error
 }
 
 func NewPluginAdapter() *PluginAdapter {
 	p := &PluginAdapter{
 		profiles:  make(map[string]deviceCredentials),
 		loopStops: make(map[string]context.CancelFunc),
+		seen:      make(map[string]struct{}),
 	}
 	p.clientFactory = p.defaultClientFactory
 	return p
@@ -62,10 +75,9 @@ func (p *PluginAdapter) defaultClientFactory(creds deviceCredentials) cameraClie
 	return amcrest.NewClient(baseURL, creds.Username, creds.Password, nil)
 }
 
-func (p *PluginAdapter) OnInitialize(config runner.Config, state types.Storage) (types.Manifest, types.Storage) {
+func (p *PluginAdapter) Initialize(ctx runner.PluginContext) (types.Manifest, error) {
 	p.cfg = loadPluginConfigFromEnv()
-	p.sink = config.EventSink
-	p.rawStore = config.RawStore
+	p.pctx = ctx
 
 	schemas := append([]types.DomainDescriptor{}, types.CoreDomains()...)
 	schemas = append(schemas, types.DomainDescriptor{
@@ -85,14 +97,52 @@ func (p *PluginAdapter) OnInitialize(config runner.Config, state types.Storage) 
 		Name:    "Amcrest Plugin",
 		Version: "0.2.0",
 		Schemas: schemas,
-	}, state
+	}, nil
 }
 
-func (p *PluginAdapter) OnReady() {}
+func (p *PluginAdapter) Start(_ context.Context) error {
+	if p.pctx.Registry == nil {
+		return nil
+	}
+	p.runCtx, p.runCancel = context.WithCancel(context.Background())
+	p.ensureCoreState()
+	p.reconcileAllDevices()
+	p.runWG.Add(1)
+	go func() {
+		defer p.runWG.Done()
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-p.runCtx.Done():
+				return
+			case <-t.C:
+				p.reconcileAllDevices()
+			}
+		}
+	}()
+	p.runWG.Add(1)
+	go func() {
+		defer p.runWG.Done()
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-p.runCtx.Done():
+				return
+			case <-t.C:
+				p.reconcileNewDevices()
+			}
+		}
+	}()
+	return nil
+}
 
-func (p *PluginAdapter) WaitReady(ctx context.Context) error { return nil }
-
-func (p *PluginAdapter) OnShutdown() {
+func (p *PluginAdapter) Stop() error {
+	if p.runCancel != nil {
+		p.runCancel()
+		p.runWG.Wait()
+	}
 	p.mu.Lock()
 	for _, cancel := range p.loopStops {
 		cancel()
@@ -100,148 +150,23 @@ func (p *PluginAdapter) OnShutdown() {
 	p.loopStops = make(map[string]context.CancelFunc)
 	p.mu.Unlock()
 	p.loopsWG.Wait()
+	return nil
+}
+
+func (p *PluginAdapter) OnReset() error {
+	_ = p.Stop()
+	if p.pctx.Registry == nil {
+		return nil
+	}
+	for _, dev := range p.pctx.Registry.LoadDevices() {
+		_ = p.pctx.Registry.DeleteDevice(dev.ID)
+	}
+	return p.pctx.Registry.DeleteState()
 }
 
 func (p *PluginAdapter) OnHealthCheck() (string, error) { return "perfect", nil }
 
-func (p *PluginAdapter) OnConfigUpdate(current types.Storage) (types.Storage, error) {
-	return current, nil
-}
-
-func (p *PluginAdapter) OnDeviceCreate(dev types.Device) (types.Device, error) {
-	creds := parseDeviceCredentials(dev.Labels, p.cfg)
-	if !creds.valid() {
-		return dev, fmt.Errorf("missing required labels: %s, %s, %s", labelHost, labelUsername, labelPassword)
-	}
-
-	if dev.ID == "" {
-		dev.ID = deviceIDForHost(creds.Host)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.ConnectTimeout)
-	defer cancel()
-
-	client := p.clientFactory(creds)
-	if info, err := getSystemInfoWithTimeout(ctx, client); err != nil {
-		return dev, fmt.Errorf("amcrest connect failed: %w", err)
-	} else {
-		if model := strings.TrimSpace(info["deviceType"]); model != "" {
-			creds.Model = model
-		}
-		if serial := strings.TrimSpace(info["serialNumber"]); serial != "" {
-			creds.Serial = serial
-		}
-	}
-	if version, err := client.GetSoftwareVersion(ctx); err == nil {
-		creds.Version = strings.TrimSpace(version)
-	}
-	creds.ConfigOptions = p.discoverConfigOptions(client)
-	creds.Caps = p.discoverCapabilities(client, creds)
-	creds.EventCodes = p.filterEventCodesByCapabilities(creds.EventCodes, creds.Caps)
-
-	if err := p.writeDeviceCreds(dev.ID, creds); err != nil {
-		return dev, err
-	}
-	p.storeCreds(dev.ID, creds)
-	p.ensureEventLoop(dev.ID)
-
-	dev.SourceID = creds.Host
-	if creds.Serial != "" {
-		dev.SourceID = creds.Serial
-	}
-	dev.SourceName = creds.sourceName()
-	if dev.LocalName == "" {
-		dev.LocalName = creds.localName()
-	}
-	dev.Labels = scrubSensitiveLabels(dev.Labels)
-
-	return dev, nil
-}
-
-func (p *PluginAdapter) OnDeviceUpdate(dev types.Device) (types.Device, error) {
-	return dev, nil
-}
-
-func (p *PluginAdapter) OnDeviceDelete(id string) error {
-	p.stopEventLoop(id)
-	return nil
-}
-
-func (p *PluginAdapter) OnDeviceSearch(q types.SearchQuery, res []types.Device) ([]types.Device, error) {
-	return res, nil
-}
-
-func (p *PluginAdapter) OnDeviceDiscover(current []types.Device) ([]types.Device, error) {
-	for i := range current {
-		if current[i].ID == pluginID {
-			continue
-		}
-		if creds, ok := p.readOrCachedCreds(current[i].ID); ok {
-			if current[i].SourceID == "" {
-				current[i].SourceID = creds.Host
-				if creds.Serial != "" {
-					current[i].SourceID = creds.Serial
-				}
-			}
-			if current[i].SourceName == "" {
-				current[i].SourceName = creds.sourceName()
-			}
-			if current[i].LocalName == "" {
-				current[i].LocalName = creds.localName()
-			}
-			p.ensureEventLoop(current[i].ID)
-		}
-	}
-	return runner.EnsureCoreDevice(pluginID, current), nil
-}
-
-func (p *PluginAdapter) OnEntityCreate(e types.Entity) (types.Entity, error) { return e, nil }
-func (p *PluginAdapter) OnEntityUpdate(e types.Entity) (types.Entity, error) { return e, nil }
-func (p *PluginAdapter) OnEntityDelete(deviceID, entityID string) error      { return nil }
-
-func (p *PluginAdapter) OnEntityDiscover(deviceID string, current []types.Entity) ([]types.Entity, error) {
-	if deviceID == pluginID {
-		return runner.EnsureCoreEntities(pluginID, deviceID, current), nil
-	}
-	entities := []types.Entity{
-		{ID: availabilityEntity, DeviceID: deviceID, Domain: "binary_sensor", LocalName: "Availability"},
-	}
-	if creds, ok := p.readOrCachedCreds(deviceID); ok {
-		if creds.Caps.StreamMain {
-			entities = append(entities, types.Entity{ID: streamEntityID, DeviceID: deviceID, Domain: "stream", LocalName: "Main Stream"})
-		}
-		if creds.Caps.Snapshot {
-			entities = append(entities,
-				types.Entity{ID: snapshotEntityID, DeviceID: deviceID, Domain: "image", LocalName: "Snapshot"},
-				types.Entity{ID: snapshotButtonID, DeviceID: deviceID, Domain: "button", LocalName: "Capture Snapshot", Actions: []string{"press"}},
-			)
-		}
-		if creds.Caps.Motion {
-			entities = append(entities, types.Entity{ID: motionEntityID, DeviceID: deviceID, Domain: "binary_sensor", LocalName: "Motion"})
-		}
-		if creds.Caps.DoorbellPress {
-			entities = append(entities, types.Entity{ID: doorbellEntityID, DeviceID: deviceID, Domain: "binary_sensor", LocalName: "Doorbell Press"})
-		}
-		for _, cfg := range creds.ConfigOptions {
-			payload, _ := json.Marshal(map[string]any{
-				"config":  cfg.Name,
-				"enabled": cfg.Enabled,
-			})
-			entities = append(entities, types.Entity{
-				ID:        "cfg-" + sanitizeEntityID(cfg.Name),
-				DeviceID:  deviceID,
-				Domain:    "binary_sensor",
-				LocalName: fmt.Sprintf("Config: %s", cfg.Name),
-				Data: types.EntityData{
-					Reported: payload,
-				},
-			})
-		}
-	}
-	return runner.EnsureCoreEntities(pluginID, deviceID, entities), nil
-}
-
-func (p *PluginAdapter) OnCommand(req types.Command, entity types.Entity) (types.Entity, error) {
+func (p *PluginAdapter) runCommand(req types.Command, entity types.Entity) (types.Entity, error) {
 	if entity.ID != snapshotButtonID {
 		return entity, nil
 	}
@@ -260,24 +185,28 @@ func (p *PluginAdapter) OnCommand(req types.Command, entity types.Entity) (types
 		return entity, err
 	}
 
-	if p.sink != nil {
+	if p.pctx.Events != nil {
 		payload, _ := json.Marshal(map[string]any{
 			"type":        "updated",
 			"format":      "jpeg",
 			"size_bytes":  len(snapshot),
 			"captured_at": time.Now().UTC().Format(time.RFC3339),
 		})
-		_ = p.sink.EmitEvent(types.InboundEvent{DeviceID: req.DeviceID, EntityID: snapshotEntityID, Payload: payload})
+		_ = p.pctx.Events.PublishEvent(types.InboundEvent{DeviceID: req.DeviceID, EntityID: snapshotEntityID, Payload: payload})
 	}
 	return entity, nil
 }
 
-func (p *PluginAdapter) OnEvent(evt types.Event, entity types.Entity) (types.Entity, error) {
-	return entity, nil
+func (p *PluginAdapter) OnCommand(req types.Command, entity types.Entity) error {
+	updated, err := p.runCommand(req, entity)
+	if p.pctx.Registry != nil && updated.ID != "" && updated.DeviceID != "" {
+		_ = p.pctx.Registry.SaveEntity(updated)
+	}
+	return err
 }
 
 func (p *PluginAdapter) ensureEventLoop(deviceID string) {
-	if p.sink == nil {
+	if p.pctx.Events == nil {
 		return
 	}
 	creds, ok := p.readOrCachedCreds(deviceID)
@@ -303,6 +232,178 @@ func (p *PluginAdapter) ensureEventLoop(deviceID string) {
 		defer p.stopEventLoop(deviceID)
 		p.runEventLoop(ctx, deviceID, creds)
 	}()
+}
+
+func (p *PluginAdapter) ensureCoreState() {
+	if p.pctx.Registry == nil {
+		return
+	}
+	coreID := types.CoreDeviceID(pluginID)
+	_ = p.pctx.Registry.SaveDevice(types.Device{
+		ID:         coreID,
+		SourceID:   coreID,
+		SourceName: pluginID,
+		LocalName:  pluginID,
+	})
+	for _, ent := range types.CoreEntities(pluginID) {
+		_ = p.pctx.Registry.SaveEntity(ent)
+	}
+}
+
+func (p *PluginAdapter) reconcileAllDevices() {
+	if p.pctx.Registry == nil {
+		return
+	}
+	devices := p.pctx.Registry.LoadDevices()
+	for _, dev := range devices {
+		if dev.ID == types.CoreDeviceID(pluginID) {
+			continue
+		}
+		updated, creds, ok := p.resolveAndHydrateDevice(dev)
+		if !ok {
+			continue
+		}
+		_ = p.pctx.Registry.SaveDevice(updated)
+		p.syncEntitiesForDevice(updated.ID, creds)
+		p.ensureEventLoop(updated.ID)
+		p.markSeen(updated.ID)
+	}
+}
+
+func (p *PluginAdapter) reconcileNewDevices() {
+	if p.pctx.Registry == nil {
+		return
+	}
+	for _, dev := range p.pctx.Registry.LoadDevices() {
+		if dev.ID == types.CoreDeviceID(pluginID) {
+			continue
+		}
+		if p.isSeen(dev.ID) {
+			continue
+		}
+		updated, creds, ok := p.resolveAndHydrateDevice(dev)
+		if !ok {
+			continue
+		}
+		_ = p.pctx.Registry.SaveDevice(updated)
+		p.syncEntitiesForDevice(updated.ID, creds)
+		p.ensureEventLoop(updated.ID)
+		p.markSeen(updated.ID)
+	}
+}
+
+func (p *PluginAdapter) markSeen(deviceID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.seen[deviceID] = struct{}{}
+}
+
+func (p *PluginAdapter) isSeen(deviceID string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, ok := p.seen[deviceID]
+	return ok
+}
+
+func (p *PluginAdapter) resolveAndHydrateDevice(dev types.Device) (types.Device, deviceCredentials, bool) {
+	if dev.ID == "" {
+		return dev, deviceCredentials{}, false
+	}
+
+	creds := parseDeviceCredentials(dev.Labels, p.cfg)
+	if !creds.valid() {
+		stored, ok := p.readOrCachedCreds(dev.ID)
+		if !ok {
+			return dev, deviceCredentials{}, false
+		}
+		creds = stored
+	} else {
+		if dev.ID == "" {
+			dev.ID = deviceIDForHost(creds.Host)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), p.cfg.ConnectTimeout)
+		client := p.clientFactory(creds)
+		if info, err := getSystemInfoWithTimeout(ctx, client); err == nil {
+			if model := strings.TrimSpace(info["deviceType"]); model != "" {
+				creds.Model = model
+			}
+			if serial := strings.TrimSpace(info["serialNumber"]); serial != "" {
+				creds.Serial = serial
+			}
+		}
+		if version, err := client.GetSoftwareVersion(ctx); err == nil {
+			creds.Version = strings.TrimSpace(version)
+		}
+		cancel()
+		creds.ConfigOptions = p.discoverConfigOptions(client)
+		creds.Caps = p.discoverCapabilities(client, creds)
+		creds.EventCodes = p.filterEventCodesByCapabilities(creds.EventCodes, creds.Caps)
+		if err := p.writeDeviceCreds(dev.ID, creds); err != nil {
+			return dev, deviceCredentials{}, false
+		}
+	}
+
+	p.storeCreds(dev.ID, creds)
+	dev.SourceID = creds.Host
+	if creds.Serial != "" {
+		dev.SourceID = creds.Serial
+	}
+	dev.SourceName = creds.sourceName()
+	if strings.TrimSpace(dev.LocalName) == "" {
+		dev.LocalName = creds.localName()
+	}
+	dev.Labels = scrubSensitiveLabels(dev.Labels)
+	return dev, creds, true
+}
+
+func (p *PluginAdapter) syncEntitiesForDevice(deviceID string, creds deviceCredentials) {
+	if p.pctx.Registry == nil {
+		return
+	}
+	want := map[string]types.Entity{}
+	for _, ent := range buildEntitiesForDevice(deviceID, creds) {
+		want[ent.ID] = ent
+		_ = p.pctx.Registry.SaveEntity(ent)
+	}
+	current := p.pctx.Registry.GetEntities(p.pctx.Registry.Namespace(), deviceID)
+	for _, ent := range current {
+		if _, keep := want[ent.ID]; keep {
+			continue
+		}
+		_ = p.pctx.Registry.DeleteEntity(p.pctx.Registry.Namespace(), deviceID, ent.ID)
+	}
+}
+
+func buildEntitiesForDevice(deviceID string, creds deviceCredentials) []types.Entity {
+	entities := []types.Entity{
+		{ID: availabilityEntity, DeviceID: deviceID, Domain: "binary_sensor", LocalName: "Availability"},
+	}
+	if creds.Caps.StreamMain {
+		entities = append(entities, types.Entity{ID: streamEntityID, DeviceID: deviceID, Domain: "stream", LocalName: "Main Stream"})
+	}
+	if creds.Caps.Snapshot {
+		entities = append(entities,
+			types.Entity{ID: snapshotEntityID, DeviceID: deviceID, Domain: "image", LocalName: "Snapshot"},
+			types.Entity{ID: snapshotButtonID, DeviceID: deviceID, Domain: "button", LocalName: "Capture Snapshot", Actions: []string{"press"}},
+		)
+	}
+	if creds.Caps.Motion {
+		entities = append(entities, types.Entity{ID: motionEntityID, DeviceID: deviceID, Domain: "binary_sensor", LocalName: "Motion"})
+	}
+	if creds.Caps.DoorbellPress {
+		entities = append(entities, types.Entity{ID: doorbellEntityID, DeviceID: deviceID, Domain: "binary_sensor", LocalName: "Doorbell Press"})
+	}
+	for _, cfg := range creds.ConfigOptions {
+		payload, _ := json.Marshal(map[string]any{"config": cfg.Name, "enabled": cfg.Enabled})
+		entities = append(entities, types.Entity{
+			ID:        "cfg-" + sanitizeEntityID(cfg.Name),
+			DeviceID:  deviceID,
+			Domain:    "binary_sensor",
+			LocalName: fmt.Sprintf("Config: %s", cfg.Name),
+			Data:      types.EntityData{Reported: payload},
+		})
+	}
+	return entities
 }
 
 func (p *PluginAdapter) stopEventLoop(deviceID string) {
@@ -339,7 +440,7 @@ func (p *PluginAdapter) runEventLoop(ctx context.Context, deviceID string, creds
 }
 
 func (p *PluginAdapter) handleEvent(deviceID string, ev amcrest.Event) {
-	if p.sink == nil {
+	if p.pctx.Events == nil {
 		return
 	}
 	state := "on"
@@ -355,19 +456,30 @@ func (p *PluginAdapter) handleEvent(deviceID string, ev amcrest.Event) {
 }
 
 func (p *PluginAdapter) emitBinaryState(deviceID, entityID, state, eventType string) {
+	if p.pctx.Events == nil {
+		return
+	}
 	payload, _ := json.Marshal(map[string]any{"type": eventType, "state": state})
-	_ = p.sink.EmitEvent(types.InboundEvent{DeviceID: deviceID, EntityID: entityID, Payload: payload})
+	_ = p.pctx.Events.PublishEvent(types.InboundEvent{DeviceID: deviceID, EntityID: entityID, Payload: payload})
 }
 
 func (p *PluginAdapter) writeDeviceCreds(deviceID string, creds deviceCredentials) error {
-	if p.rawStore == nil {
-		return fmt.Errorf("raw store unavailable")
-	}
 	data, err := json.Marshal(creds)
 	if err != nil {
 		return err
 	}
-	return p.rawStore.WriteRawDevice(deviceID, data)
+	if p.rawStore != nil {
+		return p.rawStore.WriteRawDevice(deviceID, data)
+	}
+	if p.pctx.Registry == nil {
+		return fmt.Errorf("raw store unavailable")
+	}
+	state := p.loadPluginState()
+	if state.DeviceCreds == nil {
+		state.DeviceCreds = map[string]json.RawMessage{}
+	}
+	state.DeviceCreds[deviceID] = data
+	return p.savePluginState(state)
 }
 
 func (p *PluginAdapter) readOrCachedCreds(deviceID string) (deviceCredentials, bool) {
@@ -377,10 +489,7 @@ func (p *PluginAdapter) readOrCachedCreds(deviceID string) (deviceCredentials, b
 	if ok && cached.valid() {
 		return cached, true
 	}
-	if p.rawStore == nil {
-		return deviceCredentials{}, false
-	}
-	raw, err := p.rawStore.ReadRawDevice(deviceID)
+	raw, err := p.readDeviceCredsRaw(deviceID)
 	if err != nil || len(raw) == 0 {
 		return deviceCredentials{}, false
 	}
@@ -403,6 +512,21 @@ func (p *PluginAdapter) readOrCachedCreds(deviceID string) (deviceCredentials, b
 	}
 	p.storeCreds(deviceID, creds)
 	return creds, true
+}
+
+func (p *PluginAdapter) readDeviceCredsRaw(deviceID string) (json.RawMessage, error) {
+	if p.rawStore != nil {
+		return p.rawStore.ReadRawDevice(deviceID)
+	}
+	if p.pctx.Registry == nil {
+		return nil, fmt.Errorf("registry unavailable")
+	}
+	state := p.loadPluginState()
+	raw := state.DeviceCreds[deviceID]
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("not found")
+	}
+	return raw, nil
 }
 
 func (p *PluginAdapter) storeCreds(deviceID string, creds deviceCredentials) {
@@ -592,4 +716,37 @@ func sanitizeEntityID(v string) string {
 		return "unknown"
 	}
 	return out
+}
+
+type pluginState struct {
+	DeviceCreds map[string]json.RawMessage `json:"device_creds,omitempty"`
+}
+
+func (p *PluginAdapter) loadPluginState() pluginState {
+	if p.pctx.Registry == nil {
+		return pluginState{}
+	}
+	raw, ok := p.pctx.Registry.LoadState()
+	if !ok || len(raw.Data) == 0 {
+		return pluginState{DeviceCreds: map[string]json.RawMessage{}}
+	}
+	var s pluginState
+	if err := json.Unmarshal(raw.Data, &s); err != nil {
+		return pluginState{DeviceCreds: map[string]json.RawMessage{}}
+	}
+	if s.DeviceCreds == nil {
+		s.DeviceCreds = map[string]json.RawMessage{}
+	}
+	return s
+}
+
+func (p *PluginAdapter) savePluginState(s pluginState) error {
+	if p.pctx.Registry == nil {
+		return fmt.Errorf("registry unavailable")
+	}
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	return p.pctx.Registry.SaveState(types.Storage{Data: raw})
 }
