@@ -6,7 +6,7 @@ require (
 	github.com/cucumber/godog v0.15.1
 	github.com/slidebolt/sdk-integration-testing v0.0.3
 	github.com/slidebolt/sdk-runner v1.20.3
-	github.com/slidebolt/sdk-types v1.20.6
+	github.com/slidebolt/sdk-types v1.20.7
 	github.com/stretchr/testify v1.11.1
 )
 
@@ -41,3 +41,5 @@ replace github.com/slidebolt/registry => ../registry
 replace github.com/slidebolt/sdk-integration-testing => ../sdk-integration-testing
 
 replace github.com/slidebolt/sdk-runner => ../sdk-runner
+
+replace github.com/slidebolt/sdk-entities => ../sdk-entities
