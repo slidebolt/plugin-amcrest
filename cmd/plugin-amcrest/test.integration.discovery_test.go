@@ -12,7 +12,7 @@ import (
 
 	app "github.com/slidebolt/plugin-amcrest/app"
 	domain "github.com/slidebolt/sb-domain"
-	managersdk "github.com/slidebolt/sb-manager-sdk"
+	testkit "github.com/slidebolt/sb-testkit"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	storage "github.com/slidebolt/sb-storage-sdk"
 )
@@ -105,7 +105,7 @@ func TestDiscovery_FindCameras(t *testing.T) {
 		}
 	}
 
-	env := managersdk.NewTestEnv(t)
+	env := testkit.NewTestEnv(t)
 	env.Start("messenger")
 	env.Start("storage")
 	saveProvisionedCamera(t, env.Storage(), envVars)
