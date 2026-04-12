@@ -25,6 +25,7 @@ import (
 
 	contract "github.com/slidebolt/sb-contract"
 	domain "github.com/slidebolt/sb-domain"
+	messenger "github.com/slidebolt/sb-messenger-sdk"
 	storage "github.com/slidebolt/sb-storage-sdk"
 )
 
@@ -355,14 +356,17 @@ type DeviceStatus struct {
 
 type App struct {
 	store storage.Storage
+	msg   messenger.Messenger
 
-	mu      sync.RWMutex
-	clients map[string]*AmcrestClient
-	devices map[string]domain.Device
-	status  map[string]DeviceStatus
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	mu            sync.RWMutex
+	clients       map[string]*AmcrestClient
+	devices       map[string]domain.Device
+	status        map[string]DeviceStatus
+	deviceCancels map[string]context.CancelFunc
+	deviceWatch   *storage.Watcher
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
 }
 
 func New() *App {
@@ -402,14 +406,24 @@ func (a *App) Hello() contract.HelloResponse {
 }
 
 func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) {
+	msg, err := messenger.Connect(deps)
+	if err != nil {
+		return nil, fmt.Errorf("connect messenger: %w", err)
+	}
+	a.msg = msg
+
 	store, err := storage.Connect(deps)
 	if err != nil {
+		if a.msg != nil {
+			a.msg.Close()
+		}
 		return nil, fmt.Errorf("connect storage: %w", err)
 	}
 	a.store = store
 
 	a.clients = make(map[string]*AmcrestClient)
 	a.devices = make(map[string]domain.Device)
+	a.deviceCancels = make(map[string]context.CancelFunc)
 	if a.status == nil {
 		a.status = make(map[string]DeviceStatus)
 	}
@@ -418,18 +432,27 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 	if err := a.reconcileStoredDevices(); err != nil {
 		log.Printf("plugin-amcrest: device discovery error: %v", err)
 	}
+	if err := a.watchProvisionedDevices(); err != nil {
+		log.Printf("plugin-amcrest: device watch error: %v", err)
+	}
 
 	log.Println("plugin-amcrest: started")
 	return nil, nil
 }
 
 func (a *App) OnShutdown() error {
+	if a.deviceWatch != nil {
+		a.deviceWatch.Stop()
+	}
 	if a.cancel != nil {
 		a.cancel()
 	}
 	a.wg.Wait()
 	if a.store != nil {
 		a.store.Close()
+	}
+	if a.msg != nil {
+		a.msg.Close()
 	}
 	return nil
 }
@@ -451,46 +474,143 @@ func (a *App) reconcileStoredDevices() error {
 			log.Printf("plugin-amcrest: invalid stored device %s: %v", entry.Key, err)
 			continue
 		}
-		a.mu.Lock()
-		a.devices[device.ID] = device
-		a.mu.Unlock()
-
-		cfg, err := cameraConfigFromPrivate(a.store, device)
-		if err != nil {
-			log.Printf("plugin-amcrest: cannot load credentials for %s: %v", device.ID, err)
-			continue
+		if err := a.upsertProvisionedDevice(ctx, device); err != nil {
+			log.Printf("plugin-amcrest: sync device %s: %v", device.ID, err)
 		}
-
-		client := newClientFromConfig(cfg)
-		a.clients[cfg.ID] = client
-
-		status := DeviceStatus{}
-		if info, err := client.GetSystemInfo(ctx); err != nil {
-			status.LastError = err.Error()
-			log.Printf("plugin-amcrest: failed to connect to device %s: %v", cfg.ID, err)
-		} else {
-			status.Connected = true
-			status.DeviceInfo = info
-		}
-		if version, err := client.GetSoftwareVersion(ctx); err == nil {
-			status.Version = version
-		}
-		if codes, err := client.GetEventCodes(ctx); err == nil {
-			status.EventCodes = codes
-		}
-		current := a.setStatus(cfg.ID, func(s *DeviceStatus) { *s = status })
-		if err := a.syncDeviceEntities(device, current); err != nil {
-			log.Printf("plugin-amcrest: failed to save device entities for %s: %v", cfg.ID, err)
-		}
-		log.Printf("plugin-amcrest: synced device %s (connected=%t)", cfg.ID, current.Connected)
-
-		a.wg.Add(1)
-		go func(device domain.Device, client *AmcrestClient) {
-			defer a.wg.Done()
-			a.runEventLoop(a.ctx, device, client)
-		}(device, client)
 	}
 	return nil
+}
+
+func (a *App) watchProvisionedDevices() error {
+	w, err := storage.Watch(a.msg, storage.Query{Pattern: PluginID + ".*"}, storage.WatchHandlers{
+		OnAdd: func(_ string, data json.RawMessage) {
+			a.handleProvisionedDeviceChange(data)
+		},
+		OnUpdate: func(_ string, data json.RawMessage) {
+			a.handleProvisionedDeviceChange(data)
+		},
+		OnRemove: func(key string, _ json.RawMessage) {
+			deviceID := strings.TrimPrefix(key, PluginID+".")
+			if deviceID == "" || strings.Contains(deviceID, ".") {
+				return
+			}
+			a.removeProvisionedDevice(deviceID)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	entries, err := a.store.Search(PluginID + ".*")
+	if err != nil {
+		w.Stop()
+		return err
+	}
+	for _, entry := range entries {
+		if strings.Count(entry.Key, ".") != 1 {
+			continue
+		}
+		w.Populate(entry.Key, entry.Data)
+	}
+	a.deviceWatch = w
+	return nil
+}
+
+func (a *App) handleProvisionedDeviceChange(data json.RawMessage) {
+	var device domain.Device
+	if err := json.Unmarshal(data, &device); err != nil {
+		log.Printf("plugin-amcrest: invalid watched device: %v", err)
+		return
+	}
+	if device.ID == "" {
+		return
+	}
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		if err := a.upsertProvisionedDevice(a.ctx, device); err != nil {
+			log.Printf("plugin-amcrest: watched device %s: %v", device.ID, err)
+		}
+	}()
+}
+
+func (a *App) upsertProvisionedDevice(ctx context.Context, device domain.Device) error {
+	a.mu.Lock()
+	a.devices[device.ID] = device
+	_, alreadyRunning := a.deviceCancels[device.ID]
+	a.mu.Unlock()
+
+	cfg, err := cameraConfigFromPrivate(a.store, device)
+	if err != nil {
+		return fmt.Errorf("load credentials: %w", err)
+	}
+
+	client := newClientFromConfig(cfg)
+	status := DeviceStatus{}
+	if info, err := client.GetSystemInfo(ctx); err != nil {
+		status.LastError = err.Error()
+		log.Printf("plugin-amcrest: failed to connect to device %s: %v", cfg.ID, err)
+	} else {
+		status.Connected = true
+		status.DeviceInfo = info
+	}
+	if version, err := client.GetSoftwareVersion(ctx); err == nil {
+		status.Version = version
+	}
+	if codes, err := client.GetEventCodes(ctx); err == nil {
+		status.EventCodes = codes
+	}
+	current := a.setStatus(cfg.ID, func(s *DeviceStatus) { *s = status })
+	if err := a.syncDeviceEntities(device, current); err != nil {
+		return fmt.Errorf("save device entities: %w", err)
+	}
+
+	if !alreadyRunning {
+		deviceCtx, deviceCancel := context.WithCancel(a.ctx)
+		a.mu.Lock()
+		if _, exists := a.deviceCancels[device.ID]; exists {
+			a.mu.Unlock()
+			deviceCancel()
+		} else {
+			a.clients[cfg.ID] = client
+			a.deviceCancels[device.ID] = deviceCancel
+			a.mu.Unlock()
+			a.wg.Add(1)
+			go func(device domain.Device, client *AmcrestClient) {
+				defer a.wg.Done()
+				a.runEventLoop(deviceCtx, device, client)
+			}(device, client)
+		}
+	} else {
+		a.mu.Lock()
+		a.clients[cfg.ID] = client
+		a.mu.Unlock()
+	}
+
+	log.Printf("plugin-amcrest: synced device %s (connected=%t)", cfg.ID, current.Connected)
+	return nil
+}
+
+func (a *App) removeProvisionedDevice(deviceID string) {
+	a.mu.Lock()
+	if cancel, ok := a.deviceCancels[deviceID]; ok {
+		cancel()
+		delete(a.deviceCancels, deviceID)
+	}
+	delete(a.clients, deviceID)
+	delete(a.devices, deviceID)
+	delete(a.status, deviceID)
+	a.mu.Unlock()
+
+	entries, err := a.store.Search(PluginID + "." + deviceID + ".>")
+	if err != nil {
+		log.Printf("plugin-amcrest: remove %s: search entities: %v", deviceID, err)
+		return
+	}
+	for _, entry := range entries {
+		if err := a.store.Delete(entityKey(entry.Key)); err != nil {
+			log.Printf("plugin-amcrest: remove %s: delete %s: %v", deviceID, entry.Key, err)
+		}
+	}
 }
 
 func newClientFromConfig(cfg CameraConfig) *AmcrestClient {
