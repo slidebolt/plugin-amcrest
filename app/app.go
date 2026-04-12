@@ -1,14 +1,16 @@
-// plugin-amcrest integrates Amcrest IP cameras with SlideBolt.
+// plugin-amcrest integrates Amcrest event-capable devices with SlideBolt.
 //
 // Features:
 //   - HTTP Digest authentication
-//   - Camera entity discovery from configuration
-//   - Snapshot command for fetching JPEG images
+//   - Manual per-device provisioning
 //   - Device info and event code querying
+//   - Long-poll event stream ingestion
+//   - Generic event-derived entity updates
 package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/json"
@@ -16,12 +18,13 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	contract "github.com/slidebolt/sb-contract"
 	domain "github.com/slidebolt/sb-domain"
-	messenger "github.com/slidebolt/sb-messenger-sdk"
 	storage "github.com/slidebolt/sb-storage-sdk"
 )
 
@@ -41,19 +44,15 @@ type PluginConfig struct {
 	Cameras []CameraConfig `json:"cameras"`
 }
 
-type CameraSnapshot struct{}
-
-func (CameraSnapshot) ActionName() string { return "camera_snapshot" }
-
-func init() {
-	domain.RegisterCommand("camera_snapshot", CameraSnapshot{})
-}
-
 type AmcrestClient struct {
 	BaseURL    string
 	Username   string
 	Password   string
 	HTTPClient *http.Client
+	// RawLineHook, if set, is invoked for every non-empty line read from
+	// the event stream — including multipart boundaries and headers — for
+	// debugging. Never invoked in production code paths that don't set it.
+	RawLineHook func(line string)
 }
 
 func NewAmcrestClient(baseURL, username, password string, timeout time.Duration) *AmcrestClient {
@@ -103,6 +102,114 @@ func (c *AmcrestClient) GetEventCodes(ctx context.Context) ([]string, error) {
 	}
 	defer resp.Body.Close()
 	return parseEventCodes(resp.Body), nil
+}
+
+// Event is a single Amcrest event decoded from the long-poll event stream.
+// Raw preserves the original "Code=...;action=...;index=...;data=..." line.
+type Event struct {
+	Code   string
+	Action string
+	Index  string
+	Data   string
+	Raw    string
+}
+
+// StreamEvents opens a long-poll HTTP Digest connection to eventManager.cgi
+// and invokes fn for every event received until ctx is cancelled or the
+// stream errors. codes is a bracketed filter like "[All]" or
+// "[VideoMotion,CallNoAnswered]". Returns the context/stream error, or nil
+// if ctx was cancelled cleanly.
+func (c *AmcrestClient) StreamEvents(ctx context.Context, codes string, fn func(Event)) error {
+	if codes == "" {
+		codes = "[All]"
+	}
+	// heartbeat=N asks the camera to emit a keepalive line every N seconds
+	// so the long poll proves liveness even when no real events fire.
+	path := "/cgi-bin/eventManager.cgi?action=attach&codes=" + codes + "&heartbeat=5"
+
+	// Long-poll needs a client with no overall timeout; reuse transport only.
+	streamClient := &http.Client{Transport: http.DefaultTransport}
+
+	doReq := func(auth string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+		if err != nil {
+			return nil, err
+		}
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		return streamClient.Do(req)
+	}
+
+	resp, err := doReq("")
+	if err != nil {
+		return fmt.Errorf("event stream initial request: %w", err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		challenge := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+		if !strings.HasPrefix(challenge, "Digest") {
+			return fmt.Errorf("expected digest challenge, got: %s", challenge)
+		}
+		params := parseDigestChallenge(challenge)
+		auth := buildDigestAuthHeader(c.Username, c.Password, http.MethodGet, path, params)
+		resp, err = doReq(auth)
+		if err != nil {
+			return fmt.Errorf("event stream authed request: %w", err)
+		}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("event stream: unexpected status %d", resp.StatusCode)
+	}
+	if c.RawLineHook != nil {
+		c.RawLineHook(fmt.Sprintf("[debug] status=%d content-type=%q", resp.StatusCode, resp.Header.Get("Content-Type")))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 4096), 1<<20)
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return nil
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if c.RawLineHook != nil {
+			c.RawLineHook(line)
+		}
+		if line == "Heartbeat" {
+			fn(Event{Code: "Heartbeat", Raw: line})
+			continue
+		}
+		if !strings.HasPrefix(line, "Code=") {
+			continue
+		}
+		fn(parseEventLine(line))
+	}
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
+		return fmt.Errorf("event stream read: %w", err)
+	}
+	return nil
+}
+
+func parseEventLine(line string) Event {
+	ev := Event{Raw: line}
+	for _, part := range strings.Split(line, ";") {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(k) {
+		case "Code":
+			ev.Code = strings.TrimSpace(v)
+		case "action":
+			ev.Action = strings.TrimSpace(v)
+		case "index":
+			ev.Index = strings.TrimSpace(v)
+		case "data":
+			ev.Data = strings.TrimSpace(v)
+		}
+	}
+	return ev
 }
 
 func (c *AmcrestClient) getWithDigest(ctx context.Context, path string) (*http.Response, error) {
@@ -229,16 +336,60 @@ func parseEventCodes(r io.Reader) []string {
 	return out
 }
 
+// DeviceStatus is plugin-owned runtime state for an Amcrest device.
+type DeviceStatus struct {
+	Connected       bool
+	LastError       string
+	Version         string
+	DeviceInfo      map[string]string
+	EventCodes      []string
+	LastHeartbeatAt string
+	LastEventAt     string
+	LastEventCode   string
+	LastEventAction string
+	LastEventRaw    string
+	Reconnects      uint64
+	ActiveEvents    map[string]bool
+	EventCounts     map[string]int
+}
+
 type App struct {
-	msg     messenger.Messenger
-	store   storage.Storage
-	cmds    *messenger.Commands
-	subs    []messenger.Subscription
+	store storage.Storage
+
+	mu      sync.RWMutex
 	clients map[string]*AmcrestClient
+	devices map[string]domain.Device
+	status  map[string]DeviceStatus
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
 }
 
 func New() *App {
-	return &App{}
+	return &App{status: make(map[string]DeviceStatus)}
+}
+
+// Status returns the current runtime status for a device.
+func (a *App) Status(cameraID string) (DeviceStatus, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	s, ok := a.status[cameraID]
+	return s, ok
+}
+
+func (a *App) setStatus(cameraID string, update func(*DeviceStatus)) DeviceStatus {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s := a.status[cameraID]
+	if s.ActiveEvents == nil {
+		s.ActiveEvents = map[string]bool{}
+	}
+	if s.EventCounts == nil {
+		s.EventCounts = map[string]int{}
+	}
+	update(&s)
+	a.status[cameraID] = s
+	return cloneStatus(s)
 }
 
 func (a *App) Hello() contract.HelloResponse {
@@ -251,12 +402,6 @@ func (a *App) Hello() contract.HelloResponse {
 }
 
 func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) {
-	msg, err := messenger.Connect(deps)
-	if err != nil {
-		return nil, fmt.Errorf("connect messenger: %w", err)
-	}
-	a.msg = msg
-
 	store, err := storage.Connect(deps)
 	if err != nil {
 		return nil, fmt.Errorf("connect storage: %w", err)
@@ -264,15 +409,14 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 	a.store = store
 
 	a.clients = make(map[string]*AmcrestClient)
-	a.cmds = messenger.NewCommands(msg, domain.LookupCommand)
-	sub, err := a.cmds.Receive(PluginID+".>", a.handleCommand)
-	if err != nil {
-		return nil, fmt.Errorf("subscribe commands: %w", err)
+	a.devices = make(map[string]domain.Device)
+	if a.status == nil {
+		a.status = make(map[string]DeviceStatus)
 	}
-	a.subs = append(a.subs, sub)
+	a.ctx, a.cancel = context.WithCancel(context.Background())
 
-	if err := a.reconcileStoredCameras(); err != nil {
-		log.Printf("plugin-amcrest: camera discovery error: %v", err)
+	if err := a.reconcileStoredDevices(); err != nil {
+		log.Printf("plugin-amcrest: device discovery error: %v", err)
 	}
 
 	log.Println("plugin-amcrest: started")
@@ -280,19 +424,17 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 }
 
 func (a *App) OnShutdown() error {
-	for _, sub := range a.subs {
-		sub.Unsubscribe()
+	if a.cancel != nil {
+		a.cancel()
 	}
+	a.wg.Wait()
 	if a.store != nil {
 		a.store.Close()
-	}
-	if a.msg != nil {
-		a.msg.Close()
 	}
 	return nil
 }
 
-func (a *App) reconcileStoredCameras() error {
+func (a *App) reconcileStoredDevices() error {
 	entries, err := a.store.Search(PluginID + ".*")
 	if err != nil {
 		return fmt.Errorf("search devices: %w", err)
@@ -309,69 +451,44 @@ func (a *App) reconcileStoredCameras() error {
 			log.Printf("plugin-amcrest: invalid stored device %s: %v", entry.Key, err)
 			continue
 		}
+		a.mu.Lock()
+		a.devices[device.ID] = device
+		a.mu.Unlock()
 
-		cfg, err := cameraConfigFromDevice(device)
+		cfg, err := cameraConfigFromPrivate(a.store, device)
 		if err != nil {
-			log.Printf("plugin-amcrest: invalid camera config for %s: %v", device.ID, err)
+			log.Printf("plugin-amcrest: cannot load credentials for %s: %v", device.ID, err)
 			continue
 		}
 
 		client := newClientFromConfig(cfg)
 		a.clients[cfg.ID] = client
 
-		state := domain.Camera{}
-		meta := map[string]json.RawMessage{
-			"connected": json.RawMessage(`false`),
-		}
-		deviceInfo, err := client.GetSystemInfo(ctx)
-		if err != nil {
-			errJSON, _ := json.Marshal(err.Error())
-			meta["last_error"] = json.RawMessage(errJSON)
-			log.Printf("plugin-amcrest: failed to connect to camera %s: %v", cfg.ID, err)
+		status := DeviceStatus{}
+		if info, err := client.GetSystemInfo(ctx); err != nil {
+			status.LastError = err.Error()
+			log.Printf("plugin-amcrest: failed to connect to device %s: %v", cfg.ID, err)
 		} else {
-			meta["connected"] = json.RawMessage(`true`)
-			if infoJSON, err := json.Marshal(deviceInfo); err == nil {
-				meta["device_info"] = json.RawMessage(infoJSON)
-			}
+			status.Connected = true
+			status.DeviceInfo = info
 		}
-		version, err := client.GetSoftwareVersion(ctx)
-		if err == nil {
-			if vJSON, err := json.Marshal(version); err == nil {
-				meta["version"] = json.RawMessage(vJSON)
-			}
+		if version, err := client.GetSoftwareVersion(ctx); err == nil {
+			status.Version = version
 		}
-		eventCodes, err := client.GetEventCodes(ctx)
-		if err == nil {
-			if ecJSON, err := json.Marshal(eventCodes); err == nil {
-				meta["event_codes"] = json.RawMessage(ecJSON)
-			}
-			state.MotionDetection = containsMotionEvent(eventCodes)
+		if codes, err := client.GetEventCodes(ctx); err == nil {
+			status.EventCodes = codes
 		}
+		current := a.setStatus(cfg.ID, func(s *DeviceStatus) { *s = status })
+		if err := a.syncDeviceEntities(device, current); err != nil {
+			log.Printf("plugin-amcrest: failed to save device entities for %s: %v", cfg.ID, err)
+		}
+		log.Printf("plugin-amcrest: synced device %s (connected=%t)", cfg.ID, current.Connected)
 
-		entity, err := a.loadStoredCameraEntity(cfg.ID)
-		if err != nil {
-			entity = domain.Entity{
-				ID:       cfg.ID,
-				Plugin:   PluginID,
-				DeviceID: cfg.ID,
-				Type:     "camera",
-				Name:     device.Name,
-				Commands: []string{"camera_snapshot"},
-			}
-			if entity.Name == "" {
-				entity.Name = fmt.Sprintf("Amcrest Camera %s", cfg.Host)
-			}
-		}
-		entity.State = state
-		entity.Meta = meta
-		if len(entity.Commands) == 0 {
-			entity.Commands = []string{"camera_snapshot"}
-		}
-		if err := a.store.Save(entity); err != nil {
-			log.Printf("plugin-amcrest: failed to save camera entity %s: %v", cfg.ID, err)
-		} else {
-			log.Printf("plugin-amcrest: registered camera %s (connected=%s)", cfg.ID, meta["connected"])
-		}
+		a.wg.Add(1)
+		go func(device domain.Device, client *AmcrestClient) {
+			defer a.wg.Done()
+			a.runEventLoop(a.ctx, device, client)
+		}(device, client)
 	}
 	return nil
 }
@@ -393,129 +510,346 @@ func newClientFromConfig(cfg CameraConfig) *AmcrestClient {
 	return NewAmcrestClient(baseURL, cfg.Username, cfg.Password, time.Duration(timeout)*time.Millisecond)
 }
 
-func cameraConfigFromDevice(device domain.Device) (CameraConfig, error) {
+// cameraConfigFromPrivate loads camera credentials from the device's
+// private sidecar. Credentials are stored as a JSON object matching
+// CameraConfig — the whole struct round-trips through the private blob.
+func cameraConfigFromPrivate(store storage.Storage, device domain.Device) (CameraConfig, error) {
 	cfg := CameraConfig{ID: device.ID}
-
 	if cfg.ID == "" {
 		return cfg, fmt.Errorf("missing device id")
 	}
-	if err := unmarshalMetaString(device.Meta, "host", &cfg.Host); err != nil {
-		return cfg, err
+	raw, err := store.GetPrivate(device)
+	if err != nil {
+		return cfg, fmt.Errorf("get private: %w", err)
 	}
-	if err := unmarshalMetaString(device.Meta, "username", &cfg.Username); err != nil {
-		return cfg, err
+	if len(raw) == 0 || string(raw) == "null" {
+		return cfg, fmt.Errorf("no private credentials stored")
 	}
-	if err := unmarshalMetaString(device.Meta, "password", &cfg.Password); err != nil {
-		return cfg, err
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return cfg, fmt.Errorf("unmarshal private: %w", err)
 	}
-	_ = unmarshalMetaString(device.Meta, "scheme", &cfg.Scheme)
-	_ = unmarshalMetaInt(device.Meta, "port", &cfg.Port)
-	_ = unmarshalMetaInt(device.Meta, "timeout_ms", &cfg.Timeout)
-
+	cfg.ID = device.ID
 	if cfg.Host == "" || cfg.Username == "" || cfg.Password == "" {
-		return cfg, fmt.Errorf("device meta must include host, username, password")
+		return cfg, fmt.Errorf("private must include host, username, password")
 	}
 	return cfg, nil
 }
 
-func unmarshalMetaString(meta map[string]json.RawMessage, key string, dest *string) error {
-	if len(meta) == 0 {
-		return fmt.Errorf("missing meta.%s", key)
-	}
-	raw, ok := meta[key]
-	if !ok {
-		return fmt.Errorf("missing meta.%s", key)
-	}
-	return json.Unmarshal(raw, dest)
-}
+func (a *App) runEventLoop(ctx context.Context, device domain.Device, client *AmcrestClient) {
+	deviceID := device.ID
+	backoff := time.Second
+	connectedOnce := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 
-func unmarshalMetaInt(meta map[string]json.RawMessage, key string, dest *int) error {
-	if len(meta) == 0 {
-		return fmt.Errorf("missing meta.%s", key)
-	}
-	raw, ok := meta[key]
-	if !ok {
-		return fmt.Errorf("missing meta.%s", key)
-	}
-	return json.Unmarshal(raw, dest)
-}
-
-func (a *App) loadStoredCameraEntity(cameraID string) (domain.Entity, error) {
-	raw, err := a.store.Get(domain.EntityKey{Plugin: PluginID, DeviceID: cameraID, ID: cameraID})
-	if err != nil {
-		return domain.Entity{}, err
-	}
-	var entity domain.Entity
-	if err := json.Unmarshal(raw, &entity); err != nil {
-		return domain.Entity{}, err
-	}
-	return entity, nil
-}
-
-func (a *App) handleCommand(addr messenger.Address, cmd any) {
-	cameraID := addr.EntityID
-	switch cmd.(type) {
-	case CameraSnapshot:
-		a.handleSnapshot(cameraID, addr)
-	default:
-		log.Printf("plugin-amcrest: unknown command %T for %s", cmd, addr.Key())
-	}
-}
-
-func (a *App) handleSnapshot(cameraID string, addr messenger.Address) {
-	client, ok := a.clients[cameraID]
-	if !ok {
-		log.Printf("plugin-amcrest: camera %s not found", cameraID)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	snapshot, err := client.GetSnapshot(ctx)
-	if err != nil {
-		log.Printf("plugin-amcrest: snapshot failed for %s: %v", cameraID, err)
-		a.updateCameraMeta(cameraID, func(meta map[string]json.RawMessage) {
-			errJSON, _ := json.Marshal(err.Error())
-			meta["last_error"] = json.RawMessage(errJSON)
+		status := a.setStatus(deviceID, func(s *DeviceStatus) {
+			if connectedOnce {
+				s.Reconnects++
+			}
+			s.Connected = true
+			s.LastError = ""
 		})
-		return
-	}
+		if err := a.syncDeviceEntities(device, status); err != nil {
+			log.Printf("plugin-amcrest: sync before stream %s: %v", deviceID, err)
+		}
 
-	log.Printf("plugin-amcrest: snapshot for %s: %d bytes", cameraID, len(snapshot))
-	a.updateCameraMeta(cameraID, func(meta map[string]json.RawMessage) {
-		delete(meta, "last_error")
-		meta["last_snapshot_bytes"] = json.RawMessage(fmt.Sprintf(`%d`, len(snapshot)))
+		err := client.StreamEvents(ctx, "[All]", func(ev Event) {
+			status := a.applyEvent(deviceID, ev)
+			if err := a.syncDeviceEntities(device, status); err != nil {
+				log.Printf("plugin-amcrest: sync event entities %s: %v", deviceID, err)
+			}
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		connectedOnce = true
+
+		status = a.setStatus(deviceID, func(s *DeviceStatus) {
+			s.Connected = false
+			if err != nil {
+				s.LastError = err.Error()
+			}
+		})
+		if syncErr := a.syncDeviceEntities(device, status); syncErr != nil {
+			log.Printf("plugin-amcrest: sync disconnect entities %s: %v", deviceID, syncErr)
+		}
+		if err != nil {
+			log.Printf("plugin-amcrest: event stream error for %s: %v", deviceID, err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func (a *App) applyEvent(deviceID string, ev Event) DeviceStatus {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return a.setStatus(deviceID, func(s *DeviceStatus) {
+		s.Connected = true
+		s.LastError = ""
+		if ev.Code == "Heartbeat" {
+			s.LastHeartbeatAt = now
+			return
+		}
+		if s.ActiveEvents == nil {
+			s.ActiveEvents = map[string]bool{}
+		}
+		if s.EventCounts == nil {
+			s.EventCounts = map[string]int{}
+		}
+		s.EventCounts[ev.Code]++
+		if isStartAction(ev.Action) {
+			s.ActiveEvents[ev.Code] = true
+		}
+		if isStopAction(ev.Action) {
+			s.ActiveEvents[ev.Code] = false
+		}
+		if _, ok := s.ActiveEvents[ev.Code]; !ok {
+			s.ActiveEvents[ev.Code] = false
+		}
+		s.LastHeartbeatAt = now
+		s.LastEventAt = now
+		s.LastEventCode = ev.Code
+		s.LastEventAction = ev.Action
+		s.LastEventRaw = ev.Raw
 	})
 }
 
-func (a *App) updateCameraMeta(cameraID string, update func(map[string]json.RawMessage)) {
-	eKey := domain.EntityKey{Plugin: PluginID, DeviceID: cameraID, ID: cameraID}
-	raw, err := a.store.Get(eKey)
+func (a *App) syncDeviceEntities(device domain.Device, status DeviceStatus) error {
+	desired := make(map[string]domain.Entity)
+	for _, entity := range a.desiredEntities(device, status) {
+		desired[entity.Key()] = entity
+	}
+	existing, err := a.store.Search(PluginID + "." + device.ID + ".>")
 	if err != nil {
-		log.Printf("plugin-amcrest: failed to get camera %s: %v", cameraID, err)
-		return
+		return fmt.Errorf("search device entities: %w", err)
+	}
+	for _, key := range sortedEntityKeys(desired) {
+		if err := saveEntityIfChanged(a.store, desired[key]); err != nil {
+			return err
+		}
+	}
+	for _, entry := range existing {
+		if _, ok := desired[entry.Key]; ok {
+			continue
+		}
+		if err := a.store.Delete(entityKey(entry.Key)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *App) desiredEntities(device domain.Device, status DeviceStatus) []domain.Entity {
+	deviceID := device.ID
+	name := device.Name
+	if name == "" {
+		name = deviceID
+	}
+	entities := []domain.Entity{
+		{
+			ID:       "connection",
+			Plugin:   PluginID,
+			DeviceID: deviceID,
+			Type:     "diagnostic",
+			Name:     "Amcrest Event Connection",
+			State: map[string]any{
+				"connected":         status.Connected,
+				"lastError":         status.LastError,
+				"version":           status.Version,
+				"deviceInfo":        status.DeviceInfo,
+				"eventCodes":        status.EventCodes,
+				"lastHeartbeatAt":   status.LastHeartbeatAt,
+				"lastEventAt":       status.LastEventAt,
+				"lastEventCode":     status.LastEventCode,
+				"lastEventAction":   status.LastEventAction,
+				"reconnects":        status.Reconnects,
+				"deviceDisplayName": name,
+			},
+		},
+		{
+			ID:       "supported-event-codes",
+			Plugin:   PluginID,
+			DeviceID: deviceID,
+			Type:     "sensor",
+			Name:     "Supported Event Codes",
+			State:    domain.Sensor{Value: append([]string(nil), status.EventCodes...)},
+		},
+		{
+			ID:       "last-event-code",
+			Plugin:   PluginID,
+			DeviceID: deviceID,
+			Type:     "sensor",
+			Name:     "Last Event Code",
+			State:    domain.Sensor{Value: status.LastEventCode},
+		},
+		{
+			ID:       "last-event-action",
+			Plugin:   PluginID,
+			DeviceID: deviceID,
+			Type:     "sensor",
+			Name:     "Last Event Action",
+			State:    domain.Sensor{Value: status.LastEventAction},
+		},
+		{
+			ID:       "last-event-at",
+			Plugin:   PluginID,
+			DeviceID: deviceID,
+			Type:     "sensor",
+			Name:     "Last Event At",
+			State:    domain.Sensor{Value: status.LastEventAt},
+		},
+		{
+			ID:       "last-event-raw",
+			Plugin:   PluginID,
+			DeviceID: deviceID,
+			Type:     "sensor",
+			Name:     "Last Event Raw",
+			State:    domain.Sensor{Value: status.LastEventRaw},
+		},
 	}
 
-	var entity domain.Entity
-	if err := json.Unmarshal(raw, &entity); err != nil {
-		log.Printf("plugin-amcrest: failed to unmarshal camera %s: %v", cameraID, err)
-		return
+	for _, code := range status.EventCodes {
+		safe := sanitizeID(code)
+		display := displayEventCode(code)
+		entities = append(entities,
+			domain.Entity{
+				ID:       "event-" + safe,
+				Plugin:   PluginID,
+				DeviceID: deviceID,
+				Type:     "binary_sensor",
+				Name:     display,
+				State:    domain.BinarySensor{On: status.ActiveEvents[code]},
+			},
+			domain.Entity{
+				ID:       "event-" + safe + "-count",
+				Plugin:   PluginID,
+				DeviceID: deviceID,
+				Type:     "sensor",
+				Name:     display + " Count",
+				State:    domain.Sensor{Value: status.EventCounts[code]},
+			},
+		)
 	}
+	return entities
+}
 
-	if entity.Meta == nil {
-		entity.Meta = make(map[string]json.RawMessage)
+func cloneStatus(in DeviceStatus) DeviceStatus {
+	out := in
+	if in.DeviceInfo != nil {
+		out.DeviceInfo = make(map[string]string, len(in.DeviceInfo))
+		for k, v := range in.DeviceInfo {
+			out.DeviceInfo[k] = v
+		}
 	}
-	update(entity.Meta)
-	if err := a.store.Save(entity); err != nil {
-		log.Printf("plugin-amcrest: failed to update camera meta %s: %v", cameraID, err)
+	if in.EventCodes != nil {
+		out.EventCodes = append([]string(nil), in.EventCodes...)
+	}
+	if in.ActiveEvents != nil {
+		out.ActiveEvents = make(map[string]bool, len(in.ActiveEvents))
+		for k, v := range in.ActiveEvents {
+			out.ActiveEvents[k] = v
+		}
+	}
+	if in.EventCounts != nil {
+		out.EventCounts = make(map[string]int, len(in.EventCounts))
+		for k, v := range in.EventCounts {
+			out.EventCounts[k] = v
+		}
+	}
+	return out
+}
+
+func saveEntityIfChanged(store storage.Storage, entity domain.Entity) error {
+	body, err := json.Marshal(entity)
+	if err != nil {
+		return err
+	}
+	current, err := store.Get(entity)
+	if err == nil && normalizedJSON(current) == normalizedJSON(body) {
+		return nil
+	}
+	return store.Save(entity)
+}
+
+func normalizedJSON(data []byte) string {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, data); err != nil {
+		return string(data)
+	}
+	return buf.String()
+}
+
+func sortedEntityKeys(m map[string]domain.Entity) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+type entityKey string
+
+func (k entityKey) Key() string { return string(k) }
+
+func sanitizeID(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func displayEventCode(code string) string {
+	code = strings.Trim(code, "_")
+	code = strings.ReplaceAll(code, "_", " ")
+	code = strings.ReplaceAll(code, "-", " ")
+	parts := strings.Fields(code)
+	for i, part := range parts {
+		if part == strings.ToUpper(part) {
+			continue
+		}
+		parts[i] = strings.ToUpper(part[:1]) + strings.ToLower(part[1:])
+	}
+	return strings.Join(parts, " ")
+}
+
+func isStartAction(action string) bool {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "start", "pulse", "on":
+		return true
+	default:
+		return false
 	}
 }
 
-func containsMotionEvent(codes []string) bool {
-	for _, c := range codes {
-		if c == "VideoMotion" {
-			return true
-		}
+func isStopAction(action string) bool {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "stop", "end", "off":
+		return true
+	default:
+		return false
 	}
-	return false
 }

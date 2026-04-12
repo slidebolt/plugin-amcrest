@@ -1,8 +1,12 @@
 # plugin-amcrest
 
-`plugin-amcrest` is a SlideBolt plugin for Amcrest cameras. It is intentionally
-manual: cameras are provisioned as normal SlideBolt devices and then reconciled
-by the plugin. The plugin does not scan the network for cameras on startup.
+`plugin-amcrest` is a SlideBolt plugin for Amcrest device events. It is
+intentionally manual: devices are provisioned as normal SlideBolt devices and
+then reconciled by the plugin. The plugin does not scan the network on startup.
+
+It does not own camera/stream/snapshot behavior. Frigate is the camera plugin.
+`plugin-amcrest` exists to ingest vendor-specific Amcrest event signals such as
+doorbell presses and other eventManager codes that Frigate does not model.
 
 ## Connection Overview
 
@@ -16,13 +20,13 @@ by the plugin. The plugin does not scan the network for cameras on startup.
 # Run unit tests
 go test ./...
 
-# Run the real-camera integration test
+# Run the real-device integration test
 go test -tags integration -run TestDiscovery_FindCameras ./cmd/plugin-amcrest
 ```
 
-The integration test reads local camera credentials from `.env.local`, seeds a
-provisioned `Device` + `Entity`, and then starts the plugin against the shared
-test harness.
+The integration test reads local device credentials from `.env.local`, seeds a
+provisioned `Device`, and then starts the plugin against the shared test
+harness.
 
 ## API Endpoints
 
@@ -38,12 +42,6 @@ GET /cgi-bin/magicBox.cgi?action=getSoftwareVersion
 ```
 Returns: `version=2.800.0000000.18.R`
 
-### Get Snapshot
-```bash
-GET /cgi-bin/snapshot.cgi
-```
-Returns: JPEG image data
-
 ### Get Event Codes
 ```bash
 GET /cgi-bin/eventManager.cgi?action=getEventIndexes&code=All
@@ -55,12 +53,6 @@ Returns available events like: `VideoMotion`, `VideoLoss`, `VideoBlind`, `_Doorb
 GET /cgi-bin/eventManager.cgi?action=attach&codes=[VideoMotion,_DoorbellPress_]
 ```
 Returns: Multipart stream with events
-
-### Get All Config
-```bash
-GET /cgi-bin/configManager.cgi?action=getConfig&name=All
-```
-Returns: All camera configuration as key=value pairs
 
 ## Authentication Flow
 
@@ -89,12 +81,16 @@ AMCREST_TIMEOUT_MS=3000          # Optional
 ```
 
 Those values are not runtime plugin startup config. They are only used by the
-local integration test to seed a provisioned camera.
+local integration test to seed a provisioned device.
 
 ## Provisioning Model
 
-- **Per-device**: Each camera is a separate SlideBolt device
-- **Manual**: Cameras are added explicitly; there is no LAN discovery
+- **Per-device**: Each Amcrest unit is a separate SlideBolt device
+- **Manual**: Devices are added explicitly; there is no LAN discovery
 - **Digest Auth**: Uses HTTP Digest authentication (not Basic Auth)
-- **Provisioned**: The plugin reconciles already-stored device metadata into
-  live entities
+- **Event-sidecar**: The plugin reconciles already-stored device metadata into
+  event-oriented entities such as:
+  - connection diagnostics
+  - supported event codes
+  - last event metadata
+  - generic per-code binary sensors and counters

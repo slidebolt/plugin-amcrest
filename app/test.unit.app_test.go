@@ -7,47 +7,7 @@ import (
 	"time"
 
 	domain "github.com/slidebolt/sb-domain"
-	testkit "github.com/slidebolt/sb-testkit"
-	messenger "github.com/slidebolt/sb-messenger-sdk"
-	storage "github.com/slidebolt/sb-storage-sdk"
 )
-
-func env(t *testing.T) (*testkit.TestEnv, storage.Storage, *messenger.Commands) {
-	t.Helper()
-	e := testkit.NewTestEnv(t)
-	e.Start("messenger")
-	e.Start("storage")
-	cmds := messenger.NewCommands(e.Messenger(), domain.LookupCommand)
-	return e, e.Storage(), cmds
-}
-
-func saveEntity(t *testing.T, store storage.Storage, plugin, device, id, typ, name string, state any) domain.Entity {
-	t.Helper()
-	e := domain.Entity{ID: id, Plugin: plugin, DeviceID: device, Type: typ, Name: name, State: state}
-	if err := store.Save(e); err != nil {
-		t.Fatalf("save %s: %v", id, err)
-	}
-	return e
-}
-
-func queryByType(t *testing.T, store storage.Storage, typ string) []storage.Entry {
-	t.Helper()
-	entries, err := store.Query(storage.Query{Where: []storage.Filter{{Field: "type", Op: storage.Eq, Value: typ}}})
-	if err != nil {
-		t.Fatalf("query type=%s: %v", typ, err)
-	}
-	return entries
-}
-
-func TestCameraSnapshotCommandRegistration(t *testing.T) {
-	cmdType, ok := domain.LookupCommand("camera_snapshot")
-	if !ok {
-		t.Fatal("camera_snapshot command not registered")
-	}
-	if cmdType.Kind() != 25 {
-		t.Fatalf("expected struct, got %v", cmdType.Kind())
-	}
-}
 
 func TestPluginHello(t *testing.T) {
 	hello := New().Hello()
@@ -62,37 +22,94 @@ func TestPluginHello(t *testing.T) {
 	}
 }
 
-func TestCameraEntitySaveAndRetrieve(t *testing.T) {
-	_, store, _ := env(t)
-	state := domain.Camera{
-		MotionDetection: true,
+func TestDesiredEntitiesAreEventCentric(t *testing.T) {
+	app := New()
+	device := domain.Device{ID: "front-door", Plugin: PluginID, Name: "Front Door"}
+	status := DeviceStatus{
+		Connected:       true,
+		Version:         "1.2.3",
+		EventCodes:      []string{"VideoMotion", "_DoorBell_"},
+		LastHeartbeatAt: "2026-04-12T00:00:00Z",
+		LastEventAt:     "2026-04-12T00:01:00Z",
+		LastEventCode:   "_DoorBell_",
+		LastEventAction: "Start",
+		LastEventRaw:    "Code=_DoorBell_;action=Start;index=0",
+		ActiveEvents: map[string]bool{
+			"_DoorBell_": true,
+		},
+		EventCounts: map[string]int{
+			"_DoorBell_":  2,
+			"VideoMotion": 4,
+		},
 	}
-	e := saveEntity(t, store, PluginID, "cam1", "cam1", "camera", "Test Camera", state)
-	entries := queryByType(t, store, "camera")
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 camera, got %d", len(entries))
+
+	entities := app.desiredEntities(device, status)
+	byID := map[string]domain.Entity{}
+	for _, entity := range entities {
+		byID[entity.ID] = entity
 	}
-	var retrieved domain.Entity
-	if err := json.Unmarshal(entries[0].Data, &retrieved); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+
+	if _, ok := byID["front-door"]; ok {
+		t.Fatal("unexpected legacy root entity")
 	}
-	if retrieved.ID != e.ID {
-		t.Errorf("ID: got %q, want %q", retrieved.ID, e.ID)
+	if _, ok := byID["connection"]; !ok {
+		t.Fatal("missing connection entity")
 	}
-	if retrieved.Type != "camera" {
-		t.Errorf("Type: got %q, want %q", retrieved.Type, "camera")
+	if _, ok := byID["supported-event-codes"]; !ok {
+		t.Fatal("missing supported-event-codes entity")
+	}
+	doorbell, ok := byID["event-doorbell"]
+	if !ok {
+		t.Fatal("missing generic doorbell event entity")
+	}
+	if doorbell.Type != "binary_sensor" {
+		t.Fatalf("event-doorbell type = %q", doorbell.Type)
+	}
+	doorbellState, ok := doorbell.State.(domain.BinarySensor)
+	if !ok {
+		t.Fatalf("event-doorbell state type = %T", doorbell.State)
+	}
+	if !doorbellState.On {
+		t.Fatalf("event-doorbell should be active, got %+v", doorbellState)
+	}
+	countEntity, ok := byID["event-doorbell-count"]
+	if !ok {
+		t.Fatal("missing doorbell count entity")
+	}
+	countState, ok := countEntity.State.(domain.Sensor)
+	if !ok {
+		t.Fatalf("event-doorbell-count state type = %T", countEntity.State)
+	}
+	if countState.Value != 2 {
+		t.Fatalf("event-doorbell-count = %#v, want 2", countState.Value)
 	}
 }
 
-func TestContainsMotionEvent(t *testing.T) {
-	if !containsMotionEvent([]string{"VideoMotion", "VideoLoss"}) {
-		t.Error("expected true for codes containing VideoMotion")
+func TestApplyEventUpdatesHeartbeatAndCounts(t *testing.T) {
+	app := New()
+
+	status := app.applyEvent("front-door", Event{Code: "Heartbeat", Raw: "Heartbeat"})
+	if status.LastHeartbeatAt == "" {
+		t.Fatal("expected heartbeat timestamp to be set")
 	}
-	if containsMotionEvent([]string{"VideoLoss"}) {
-		t.Error("expected false for codes without VideoMotion")
+
+	status = app.applyEvent("front-door", Event{Code: "_DoorBell_", Action: "Start", Raw: "Code=_DoorBell_;action=Start"})
+	if status.LastEventCode != "_DoorBell_" {
+		t.Fatalf("LastEventCode = %q", status.LastEventCode)
 	}
-	if containsMotionEvent(nil) {
-		t.Error("expected false for nil codes")
+	if !status.ActiveEvents["_DoorBell_"] {
+		t.Fatalf("doorbell event should be active")
+	}
+	if status.EventCounts["_DoorBell_"] != 1 {
+		t.Fatalf("doorbell count = %d", status.EventCounts["_DoorBell_"])
+	}
+
+	status = app.applyEvent("front-door", Event{Code: "_DoorBell_", Action: "Stop", Raw: "Code=_DoorBell_;action=Stop"})
+	if status.ActiveEvents["_DoorBell_"] {
+		t.Fatalf("doorbell event should have been cleared")
+	}
+	if status.EventCounts["_DoorBell_"] != 2 {
+		t.Fatalf("doorbell count after stop = %d", status.EventCounts["_DoorBell_"])
 	}
 }
 
@@ -114,5 +131,38 @@ func TestParseKV(t *testing.T) {
 	got := parseKV(in)
 	if got["a"] != "1" || got["b"] != "two" {
 		t.Fatalf("unexpected kv: %+v", got)
+	}
+}
+
+func TestParseEventLine(t *testing.T) {
+	ev := parseEventLine("Code=_DoorBell_;action=Start;index=0;data=pressed")
+	if ev.Code != "_DoorBell_" || ev.Action != "Start" || ev.Index != "0" || ev.Data != "pressed" {
+		t.Fatalf("unexpected event: %+v", ev)
+	}
+}
+
+func TestStorageRoundTripForGenericEventEntities(t *testing.T) {
+	entity := domain.Entity{
+		ID:       "event-doorbell-count",
+		Plugin:   PluginID,
+		DeviceID: "front-door",
+		Type:     "sensor",
+		Name:     "DoorBell Count",
+		State:    domain.Sensor{Value: 3},
+	}
+	data, err := json.Marshal(entity)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got domain.Entity
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	state, ok := got.State.(domain.Sensor)
+	if !ok {
+		t.Fatalf("state type = %T", got.State)
+	}
+	if state.Value != float64(3) && state.Value != 3 {
+		t.Fatalf("state value = %#v", state.Value)
 	}
 }
