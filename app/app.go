@@ -607,6 +607,9 @@ func (a *App) removeProvisionedDevice(deviceID string) {
 		return
 	}
 	for _, entry := range entries {
+		if strings.Count(entry.Key, ".") != 2 {
+			continue
+		}
 		if err := a.store.Delete(entityKey(entry.Key)); err != nil {
 			log.Printf("plugin-amcrest: remove %s: delete %s: %v", deviceID, entry.Key, err)
 		}
@@ -760,6 +763,9 @@ func (a *App) syncDeviceEntities(device domain.Device, status DeviceStatus) erro
 		}
 	}
 	for _, entry := range existing {
+		if strings.Count(entry.Key, ".") != 2 {
+			continue
+		}
 		if _, ok := desired[entry.Key]; ok {
 			continue
 		}
