@@ -401,6 +401,7 @@ func (a *App) Hello() contract.HelloResponse {
 		ID:              PluginID,
 		Kind:            contract.KindPlugin,
 		ContractVersion: contract.ContractVersion,
+		Definitions:     contract.DescribePlugin("Amcrest", "Discovers Amcrest cameras and exposes their observations and diagnostics.", "binary_sensor", "diagnostic", "sensor"),
 		DependsOn:       []string{"messenger", "storage"},
 	}
 }
