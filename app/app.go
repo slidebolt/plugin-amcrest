@@ -403,6 +403,7 @@ func (a *App) Hello() contract.HelloResponse {
 		ContractVersion: contract.ContractVersion,
 		Definitions:     contract.DescribePlugin("Amcrest", "Discovers Amcrest cameras and exposes their observations and diagnostics.", "binary_sensor", "diagnostic", "sensor"),
 		DependsOn:       []string{"messenger", "storage"},
+		Setup:           contract.SelectableSetup("Cameras"),
 	}
 }
 
